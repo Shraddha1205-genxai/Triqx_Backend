@@ -196,8 +196,8 @@ export const updateProfile = async (data: UpdateProfileData) => {
       professionalDetails: user.professionalDetails || '',
       isFirstLogin: user.isFirstLogin,
     },
-    accessToken,
-    refreshToken,
+    // accessToken,
+    // refreshToken,
   };
 };
 
