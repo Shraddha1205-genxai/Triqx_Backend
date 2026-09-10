@@ -6,16 +6,6 @@ const client = new OpenAI({
   apiKey: env.openaiApiKey,
 });
 
-// Fast timeout helper (4s max) to prevent hanging requests
-const withTimeout = <T>(promise: Promise<T>, timeoutMs = 4000): Promise<T> => {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`Request timed out after ${timeoutMs}ms`)), timeoutMs)
-    ),
-  ]);
-};
-
 type ChatResponse = {
   answer: string;
   sources: string[];
@@ -57,35 +47,32 @@ export const chatWithOpenAI = async (req: Request, res: Response) => {
 
     if (env.openaiApiKey && env.openaiApiKey.startsWith('sk-')) {
       try {
-        const response = await withTimeout(
-          client.responses.create({
-            model: 'gpt-5.6-luna',
-            input: message,
-            instructions:
-              'Respond using the requested JSON schema. Only include sources explicitly provided in the user message; otherwise use an empty array.',
-            text: {
-              format: {
-                type: 'json_schema',
-                name: 'rag_response',
-                strict: true,
-                schema: {
-                  type: 'object',
-                  properties: {
-                    answer: { type: 'string' },
-                    sources: {
-                      type: 'array',
-                      items: { type: 'string' },
-                    },
-                    success: { type: 'boolean' },
+        const response = await client.responses.create({
+          model: 'gpt-5.6-luna',
+          input: message,
+          instructions:
+            'Respond using the requested JSON schema. Only include sources explicitly provided in the user message; otherwise use an empty array.',
+          text: {
+            format: {
+              type: 'json_schema',
+              name: 'rag_response',
+              strict: true,
+              schema: {
+                type: 'object',
+                properties: {
+                  answer: { type: 'string' },
+                  sources: {
+                    type: 'array',
+                    items: { type: 'string' },
                   },
-                  required: ['answer', 'sources', 'success'],
-                  additionalProperties: false,
+                  success: { type: 'boolean' },
                 },
+                required: ['answer', 'sources', 'success'],
+                additionalProperties: false,
               },
             },
-          }),
-          4000
-        );
+          },
+        });
 
         const chatResponse = JSON.parse(response.output_text) as ChatResponse;
         return res.status(200).json(chatResponse);
@@ -110,6 +97,7 @@ export const chatWithOpenAI = async (req: Request, res: Response) => {
 
 /**
  * Smart Replies API powered strictly by OpenAI v1/responses (gpt-5.6-luna)
+ * Direct call without artificial timeouts
  */
 export const generateReplies = async (req: Request, res: Response) => {
   try {
@@ -147,33 +135,30 @@ Respond ONLY using JSON in the format: {"success": true, "replies": ["reply1", "
     // Primary: OpenAI v1/responses endpoint with gpt-5.6-luna
     if (env.openaiApiKey && env.openaiApiKey.startsWith('sk-')) {
       try {
-        const response = await withTimeout(
-          client.responses.create({
-            model: 'gpt-5.6-luna',
-            input: formattedInput,
-            instructions,
-            text: {
-              format: {
-                type: 'json_schema',
-                name: 'generate_replies_response',
-                strict: true,
-                schema: {
-                  type: 'object',
-                  properties: {
-                    success: { type: 'boolean' },
-                    replies: {
-                      type: 'array',
-                      items: { type: 'string' },
-                    },
+        const response = await client.responses.create({
+          model: 'gpt-5.6-luna',
+          input: formattedInput,
+          instructions,
+          text: {
+            format: {
+              type: 'json_schema',
+              name: 'generate_replies_response',
+              strict: true,
+              schema: {
+                type: 'object',
+                properties: {
+                  success: { type: 'boolean' },
+                  replies: {
+                    type: 'array',
+                    items: { type: 'string' },
                   },
-                  required: ['success', 'replies'],
-                  additionalProperties: false,
                 },
+                required: ['success', 'replies'],
+                additionalProperties: false,
               },
             },
-          }),
-          4000
-        );
+          },
+        });
 
         if (response && response.output_text) {
           const parsed = JSON.parse(response.output_text);
