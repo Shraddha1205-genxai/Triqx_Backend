@@ -1,16 +1,13 @@
 import { Request, Response } from 'express';
 import OpenAI from 'openai';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { env } from '../config/env';
 
 const client = new OpenAI({
   apiKey: env.openaiApiKey,
 });
 
-const genAI = env.geminiApiKey ? new GoogleGenerativeAI(env.geminiApiKey) : null;
-
-// Fast timeout helper (1.2s max) to guarantee instant API responses
-const withTimeout = <T>(promise: Promise<T>, timeoutMs = 1200): Promise<T> => {
+// Fast timeout helper (4s max) to prevent hanging requests
+const withTimeout = <T>(promise: Promise<T>, timeoutMs = 4000): Promise<T> => {
   return Promise.race([
     promise,
     new Promise<T>((_, reject) =>
@@ -58,46 +55,42 @@ export const chatWithOpenAI = async (req: Request, res: Response) => {
       });
     }
 
-    // Try Gemini API (4s timeout)
-    if (env.geminiApiKey && genAI && env.geminiApiKey.length > 5) {
-      const geminiModels = ['gemini-3.5-flash-lite', 'gemini-1.5-flash-latest', 'gemini-2.0-flash-exp'];
-      for (const modelName of geminiModels) {
-        try {
-          const model = genAI.getGenerativeModel({
-            model: modelName,
-            generationConfig: { responseMimeType: 'application/json' },
-          });
-
-          const promptText = `Respond using JSON with keys: "answer" (string), "sources" (array of strings), "success" (boolean true). Only include sources explicitly provided in the message, otherwise empty array.\n\nUser Message: ${message}`;
-          const result = await withTimeout(model.generateContent(promptText), 4000);
-          const text = result.response.text();
-          const chatResponse = JSON.parse(text) as ChatResponse;
-          return res.status(200).json(chatResponse);
-        } catch (geminiError: any) {
-          console.warn(`[Gemini Controller] chatWithOpenAI model ${modelName} failed:`, geminiError?.message || geminiError);
-        }
-      }
-    }
-
-    // OpenAI fallback (1.2s timeout)
     if (env.openaiApiKey && env.openaiApiKey.startsWith('sk-')) {
       try {
-        const chatCompletion = await withTimeout(
-          client.chat.completions.create({
-            model: 'gpt-4o-mini',
-            messages: [{ role: 'user', content: message }],
+        const response = await withTimeout(
+          client.responses.create({
+            model: 'gpt-5.6-luna',
+            input: message,
+            instructions:
+              'Respond using the requested JSON schema. Only include sources explicitly provided in the user message; otherwise use an empty array.',
+            text: {
+              format: {
+                type: 'json_schema',
+                name: 'rag_response',
+                strict: true,
+                schema: {
+                  type: 'object',
+                  properties: {
+                    answer: { type: 'string' },
+                    sources: {
+                      type: 'array',
+                      items: { type: 'string' },
+                    },
+                    success: { type: 'boolean' },
+                  },
+                  required: ['answer', 'sources', 'success'],
+                  additionalProperties: false,
+                },
+              },
+            },
           }),
-          1200
+          4000
         );
 
-        const text = chatCompletion.choices[0]?.message?.content || '';
-        return res.status(200).json({
-          answer: text,
-          sources: [],
-          success: true,
-        });
+        const chatResponse = JSON.parse(response.output_text) as ChatResponse;
+        return res.status(200).json(chatResponse);
       } catch (err: any) {
-        console.warn('[OpenAI Controller] OpenAI attempt failed:', err?.message || err);
+        console.warn('[OpenAI Controller] chatWithOpenAI failed:', err?.message || err);
       }
     }
 
@@ -116,7 +109,7 @@ export const chatWithOpenAI = async (req: Request, res: Response) => {
 };
 
 /**
- * Hyper-Optimized Fast Smart Replies API (<1.2s response time SLA)
+ * Smart Replies API powered strictly by OpenAI v1/responses (gpt-5.6-luna)
  */
 export const generateReplies = async (req: Request, res: Response) => {
   try {
@@ -151,64 +144,52 @@ Respond ONLY using JSON in the format: {"success": true, "replies": ["reply1", "
     let replies: string[] = [];
     let isSuccess = true;
 
-    // 1. Try Gemini API once (4s timeout for live AI generation)
-    if (env.geminiApiKey && genAI && env.geminiApiKey.length > 5) {
-      const geminiModels = ['gemini-3.5-flash-lite', 'gemini-1.5-flash-latest', 'gemini-2.0-flash-exp'];
-      for (const modelName of geminiModels) {
-        try {
-          const model = genAI.getGenerativeModel({
-            model: modelName,
-            generationConfig: {
-              responseMimeType: 'application/json',
-            },
-          });
-
-          const result = await withTimeout(model.generateContent(`${instructions}\n\n${formattedInput}`), 4000);
-          const textText = result.response.text();
-          if (textText) {
-            const parsed = JSON.parse(textText);
-            if (Array.isArray(parsed.replies) && parsed.replies.length > 0) {
-              replies = parsed.replies;
-              console.log(`[Gemini Controller] Successfully generated live smart replies using ${modelName}`);
-              break;
-            }
-          }
-        } catch (geminiErr: any) {
-          console.warn(`[Gemini Controller] Model ${modelName} attempt failed:`, geminiErr?.message || geminiErr);
-        }
-      }
-    }
-
-    // 2. Try OpenAI API once (Fast 1.2s timeout)
-    if (replies.length === 0 && env.openaiApiKey && env.openaiApiKey.startsWith('sk-')) {
+    // Primary: OpenAI v1/responses endpoint with gpt-5.6-luna
+    if (env.openaiApiKey && env.openaiApiKey.startsWith('sk-')) {
       try {
-        const chatCompletion = await withTimeout(
-          client.chat.completions.create({
-            model: 'gpt-4o-mini',
-            messages: [
-              { role: 'system', content: instructions },
-              { role: 'user', content: formattedInput },
-            ],
-            response_format: { type: 'json_object' },
+        const response = await withTimeout(
+          client.responses.create({
+            model: 'gpt-5.6-luna',
+            input: formattedInput,
+            instructions,
+            text: {
+              format: {
+                type: 'json_schema',
+                name: 'generate_replies_response',
+                strict: true,
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean' },
+                    replies: {
+                      type: 'array',
+                      items: { type: 'string' },
+                    },
+                  },
+                  required: ['success', 'replies'],
+                  additionalProperties: false,
+                },
+              },
+            },
           }),
-          1200
+          4000
         );
 
-        const content = chatCompletion.choices[0]?.message?.content;
-        if (content) {
-          const parsed = JSON.parse(content);
+        if (response && response.output_text) {
+          const parsed = JSON.parse(response.output_text);
           if (Array.isArray(parsed.replies) && parsed.replies.length > 0) {
             replies = parsed.replies;
+            console.log('[OpenAI Controller] Successfully generated replies using gpt-5.6-luna (v1/responses)');
           }
         }
       } catch (openaiErr: any) {
-        console.warn('[OpenAI Controller] OpenAI attempt failed:', openaiErr?.message || openaiErr);
+        console.warn('[OpenAI Controller] gpt-5.6-luna v1/responses failed:', openaiErr?.message || openaiErr);
       }
     }
 
-    // 3. Fallback smart replies if AI models are unconfigured or failing
+    // Fallback smart replies if OpenAI model is unconfigured or failing
     if (replies.length === 0) {
-      console.warn('[AI Controller] Returning fallback smart replies with success: false');
+      console.warn('[AI Controller] OpenAI API failed or unconfigured. Returning fallback smart replies with success: false');
       isSuccess = false;
       replies = [
         'See you there!',

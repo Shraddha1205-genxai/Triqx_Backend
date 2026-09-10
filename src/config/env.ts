@@ -16,7 +16,6 @@ export const env = {
   refreshTokenExpiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN || '7d',
 
   openaiApiKey: process.env.OPENAI_API_KEY || '',
-  geminiApiKey: process.env.GEMINI_API_KEY || '',
 
   // Twilio settings
   twilio: {
