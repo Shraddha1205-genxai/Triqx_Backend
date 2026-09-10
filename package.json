@@ -22,6 +22,7 @@
   },
   "homepage": "https://github.com/Shraddha1205-genxai/Triqx_Backend#readme",
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "bcryptjs": "^2.4.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
