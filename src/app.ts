@@ -6,8 +6,6 @@ import { errorMiddleware } from './middlewares/error.middleware';
 
 const app = express();
 
-// (request logging removed)
-
 // Body parsers
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -15,6 +13,7 @@ app.use(express.urlencoded({ extended: true }));
 // API routes
 app.use(env.apiPrefix, routes);
 app.use('/openai', openaiRoutes);
+app.use('/ai', openaiRoutes);
 
 // Error handler
 app.use(errorMiddleware);
