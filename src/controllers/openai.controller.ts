@@ -180,7 +180,7 @@ Respond ONLY using JSON in the format: {"success": true, "replies": ["reply1", "
 
           const mimeType = m.mediaType ? (m.mediaType.includes('/') ? m.mediaType : `image/${m.mediaType}`) : 'image/jpeg';
           const url = `data:${mimeType};base64,${buf.toString('base64')}`;
-
+          console.log("url", url)
           contentParts.push({
             type: 'input_image',
             image_url: url,
