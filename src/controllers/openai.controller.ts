@@ -17,6 +17,8 @@ export interface MessageItem {
   text: string;
   timestamp?: number;
   isFromUser?: boolean;
+  mediaType?: string;
+  mediaBase64?: string;
 }
 
 export interface GenerateRepliesRequest {
@@ -97,7 +99,7 @@ export const chatWithOpenAI = async (req: Request, res: Response) => {
 
 /**
  * Smart Replies API powered strictly by OpenAI v1/responses (gpt-5.6-luna)
- * Direct call without artificial timeouts
+ * Supports text and image/media inputs via mediaType and mediaBase64
  */
 export const generateReplies = async (req: Request, res: Response) => {
   try {
@@ -118,13 +120,17 @@ export const generateReplies = async (req: Request, res: Response) => {
     }
 
     const conversationHistory = messages
-      .map((m) => `${m.sender || (m.isFromUser ? 'You' : 'Other')}: ${m.text}`)
+      .map((m) => {
+        const sender = m.sender || (m.isFromUser ? 'You' : 'Other');
+        const content = m.text || (m.mediaType ? '[Media Attachment]' : '');
+        return `${sender}: ${content}`;
+      })
       .join('\n');
 
     const formattedInput = `Conversation Title: ${conversationTitle}\nApp: ${appPackage}\n\nChat History:\n${conversationHistory}\n\nPlease generate ${replyCount} reply options.`;
 
     const instructions = `You are an AI assistant that generates natural smart replies for messaging apps (e.g. ${appPackage}).
-Generate exactly ${replyCount} distinct, contextually appropriate reply options based on the chat history.
+Generate exactly ${replyCount} distinct, contextually appropriate reply options based on the chat history and any attached images/media.
 Reply Style: ${replyStyle}.
 ${additionalPrompt ? `Additional Instructions: ${additionalPrompt}` : ''}
 Respond ONLY using JSON in the format: {"success": true, "replies": ["reply1", "reply2", "reply3"]}`;
@@ -132,12 +138,73 @@ Respond ONLY using JSON in the format: {"success": true, "replies": ["reply1", "
     let replies: string[] = [];
     let isSuccess = true;
 
+    // Check if any message contains media attachments (image/jpeg, image/png, etc.)
+    const mediaMessages = messages.filter((m) => m.mediaType && m.mediaBase64);
+
+    let apiInput: any = formattedInput;
+
+    if (mediaMessages.length > 0) {
+      const contentParts: any[] = [
+        {
+          type: 'input_text',
+          text: formattedInput,
+        },
+      ];
+
+      mediaMessages.forEach((m) => {
+        if (m.mediaBase64) {
+          // Clean up base64 formatting, URL-safe characters, and whitespace
+          let cleanB64 = m.mediaBase64.trim().replace(/[\r\n\s]/g, '').replace(/-/g, '+').replace(/_/g, '/');
+          if (!cleanB64) return;
+
+          if (cleanB64.startsWith('data:')) {
+            const commaIdx = cleanB64.indexOf(',');
+            if (commaIdx !== -1) {
+              cleanB64 = cleanB64.slice(commaIdx + 1);
+            }
+          }
+
+          // Ensure base64 string length is a multiple of 4
+          while (cleanB64.length % 4 !== 0) {
+            cleanB64 += '=';
+          }
+
+          let buf = Buffer.from(cleanB64, 'base64');
+
+          // Repair truncated JPEG images (append missing 0xFF, 0xD9 EOI marker if header is JPEG ffd8)
+          if (buf.length > 2 && buf[0] === 0xff && buf[1] === 0xd8) {
+            if (buf[buf.length - 2] !== 0xff || buf[buf.length - 1] !== 0xd9) {
+              buf = Buffer.concat([buf, Buffer.from([0xff, 0xd9])]);
+            }
+          }
+
+          const mimeType = m.mediaType ? (m.mediaType.includes('/') ? m.mediaType : `image/${m.mediaType}`) : 'image/jpeg';
+          const url = `data:${mimeType};base64,${buf.toString('base64')}`;
+
+          contentParts.push({
+            type: 'input_image',
+            image_url: url,
+          });
+        }
+      });
+
+      if (contentParts.length > 1) {
+        apiInput = [
+          {
+            type: 'message',
+            role: 'user',
+            content: contentParts,
+          },
+        ];
+      }
+    }
+
     // Primary: OpenAI v1/responses endpoint with gpt-5.6-luna
     if (env.openaiApiKey && env.openaiApiKey.startsWith('sk-')) {
       try {
         const response = await client.responses.create({
           model: 'gpt-5.6-luna',
-          input: formattedInput,
+          input: apiInput,
           instructions,
           text: {
             format: {
