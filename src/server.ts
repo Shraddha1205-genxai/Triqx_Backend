@@ -18,7 +18,7 @@ const startServer = async () => {
  Environment : ${env.nodeEnv}
  Port        : ${env.port}
  API Prefix  : ${env.apiPrefix}
- URL         : http://localhost:${env.port}
+ URL         : ${env.baseURL}:${env.port}
 ========================================
       `);
     });

@@ -9,6 +9,8 @@ export const env = {
 
   apiPrefix: process.env.API_PREFIX || '/api',
 
+  baseURL: process.env.BASE_URL || 'http://localhost'
+
   // JWT settings
   jwtSecret: process.env.JWT_SECRET || 'change_this_access_secret',
   accessTokenExpiresIn: process.env.ACCESS_TOKEN_EXPIRES_IN || '15m',
