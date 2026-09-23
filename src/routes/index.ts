@@ -6,5 +6,6 @@ const router = Router();
 
 router.use('/auth', authRoutes);
 router.use('/openai', openaiRoutes);
+router.use('/ai', openaiRoutes);
 
 export default router;
