@@ -1,9 +1,17 @@
 import app from './app';
 import { env } from './config/env';
+import sequelize from './config/database';
+import './models';
+const startServer = async () => {
+  try {
+    await sequelize.authenticate();
+    console.log('Database connected successfully');
 
-const startServer = () => {
-  app.listen(env.port, () => {
-    console.log(`
+    await sequelize.sync({ alter: true });
+    console.log('Database tables synchronized successfully');
+
+    app.listen(env.port, () => {
+      console.log(`
 ========================================
  AI App Backend
 ========================================
@@ -12,8 +20,12 @@ const startServer = () => {
  API Prefix  : ${env.apiPrefix}
  URL         : http://localhost:${env.port}
 ========================================
-    `);
-  });
+      `);
+    });
+  } catch (err) {
+    console.error('Failed to start server', err);
+    process.exit(1);
+  }
 };
 
 startServer();
