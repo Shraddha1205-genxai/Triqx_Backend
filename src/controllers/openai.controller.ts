@@ -21,6 +21,42 @@ export interface MessageItem {
   mediaBase64?: string;
 }
 
+export enum ObligationCategory {
+  Payment = 'Payment',
+  Work = 'Work',
+  Personal = 'Personal',
+  Security = 'Security',
+  Health = 'Health',
+  Other = 'Other',
+}
+
+export enum ObligationUrgency {
+  Critical = 'Critical',
+  High = 'High',
+  Medium = 'Medium',
+  Low = 'Low',
+}
+
+export interface ObligationItem {
+  title: string;
+  category: ObligationCategory;
+  identity: string;
+  dueTimestamp: number | null;
+  urgency: ObligationUrgency;
+  amount: number | null;
+  confidence: number;
+}
+
+export interface ExtractObligationsRequest {
+  appPackage?: string;
+  conversationTitle?: string;
+  messages: MessageItem[];
+}
+
+export interface ExtractObligationsResponse {
+  obligations: ObligationItem[];
+}
+
 export interface GenerateRepliesRequest {
   appPackage?: string;
   conversationTitle?: string;
@@ -266,4 +302,180 @@ Respond ONLY using JSON in the format: {"success": true, "replies": ["reply1", "
     });
   }
 };
+
+/**
+ * Extract obligations, bills, deadlines, and promises from incoming notification messages.
+ */
+export const extractObligations = async (req: Request, res: Response) => {
+  try {
+    const {
+      appPackage = 'com.whatsapp',
+      conversationTitle = 'Conversation',
+      messages = [],
+    } = req.body as ExtractObligationsRequest;
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(200).json({ obligations: [] });
+    }
+
+    const conversationTranscript = messages
+      .slice(-10)
+      .map((m) => {
+        const sender = m.sender || (m.isFromUser ? 'You' : conversationTitle);
+        const content = m.text || (m.mediaType ? '[Media Attachment]' : '');
+        return `${sender}: ${content}`;
+      })
+      .join('\n');
+
+    const prompt = `You are an AI obligation and priority detector.
+Analyze the following incoming notification messages from a messaging/notification app (${appPackage}) and extract any actionable obligations, pending bills, payment reminders, deadlines, promises to someone, or critical tasks.
+
+Conversation: ${conversationTitle}
+Transcript:
+${conversationTranscript}
+
+Extract obligations according to the JSON schema. If no obligations or tasks exist, return an empty array.`;
+
+    let obligations: ObligationItem[] = [];
+
+    // Primary: Call OpenAI if key is configured
+    if (env.openaiApiKey && env.openaiApiKey.startsWith('sk-')) {
+      try {
+        const response = await client.responses.create({
+          model: 'gpt-5.6-luna',
+          input: prompt,
+          instructions:
+            'Respond strictly using the JSON schema. Detect obligations such as bills, credit card dues, deadlines, and promises. Ensure category and urgency strictly conform to the allowed enum values.',
+          text: {
+            format: {
+              type: 'json_schema',
+              name: 'extract_obligations_response',
+              strict: true,
+              schema: {
+                type: 'object',
+                properties: {
+                  obligations: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        title: { type: 'string' },
+                        category: {
+                          type: 'string',
+                          enum: Object.values(ObligationCategory),
+                        },
+                        identity: { type: 'string' },
+                        dueTimestamp: { type: ['number', 'null'] },
+                        urgency: {
+                          type: 'string',
+                          enum: Object.values(ObligationUrgency),
+                        },
+                        amount: { type: ['number', 'null'] },
+                        confidence: { type: 'number' },
+                      },
+                      required: [
+                        'title',
+                        'category',
+                        'identity',
+                        'dueTimestamp',
+                        'urgency',
+                        'amount',
+                        'confidence',
+                      ],
+                      additionalProperties: false,
+                    },
+                  },
+                },
+                required: ['obligations'],
+                additionalProperties: false,
+              },
+            },
+          },
+        });
+
+        if (response && response.output_text) {
+          const parsed = JSON.parse(response.output_text);
+          if (Array.isArray(parsed.obligations)) {
+            obligations = parsed.obligations;
+            console.log(
+              `[OpenAI Controller] Extracted ${obligations.length} obligations via gpt-5.6-luna`
+            );
+          }
+        }
+      } catch (err: any) {
+        console.warn(
+          '[OpenAI Controller] client.responses.create failed, trying chat.completions fallback:',
+          err?.message || err
+        );
+
+        // Fallback: chat.completions.create with gpt-4o-mini
+        try {
+          const completion = await client.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [
+              {
+                role: 'system',
+                content: `You are an AI obligation detector. Extract any pending bills, payment reminders, deadlines, or promises from the chat transcript.
+Respond ONLY with a JSON object:
+{
+  "obligations": [
+    {
+      "title": "Short title",
+      "category": "Payment | Work | Personal | Security | Health | Other",
+      "identity": "Who or what it relates to",
+      "dueTimestamp": null,
+      "urgency": "Critical | High | Medium | Low",
+      "amount": null,
+      "confidence": 0.95
+    }
+  ]
+}
+If no obligations exist, return: {"obligations": []}`,
+              },
+              {
+                role: 'user',
+                content: prompt,
+              },
+            ],
+            response_format: { type: 'json_object' },
+          });
+
+          const content = completion.choices[0]?.message?.content;
+          if (content) {
+            const parsed = JSON.parse(content);
+            if (Array.isArray(parsed.obligations)) {
+              obligations = parsed.obligations.map((item: any) => ({
+                title: String(item.title || 'Pending Task'),
+                category: (Object.values(ObligationCategory).includes(item.category)
+                  ? item.category
+                  : ObligationCategory.Other) as ObligationCategory,
+                identity: String(item.identity || conversationTitle),
+                dueTimestamp: typeof item.dueTimestamp === 'number' ? item.dueTimestamp : null,
+                urgency: (Object.values(ObligationUrgency).includes(item.urgency)
+                  ? item.urgency
+                  : ObligationUrgency.Medium) as ObligationUrgency,
+                amount: typeof item.amount === 'number' ? item.amount : null,
+                confidence: typeof item.confidence === 'number' ? item.confidence : 0.9,
+              }));
+              console.log(
+                `[OpenAI Controller] Extracted ${obligations.length} obligations via gpt-4o-mini`
+              );
+            }
+          }
+        } catch (chatErr: any) {
+          console.warn(
+            '[OpenAI Controller] chat.completions fallback failed:',
+            chatErr?.message || chatErr
+          );
+        }
+      }
+    }
+
+    return res.status(200).json({ obligations });
+  } catch (error: any) {
+    console.error('[OpenAI Controller] extractObligations error:', error?.message || error);
+    return res.status(200).json({ obligations: [] });
+  }
+};
+
 
