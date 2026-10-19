@@ -1,6 +1,7 @@
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
+import { Op } from 'sequelize';
 import { env } from '../config/env';
 import User from '../models/user.model';
 import RefreshToken from '../models/refreshToken.model';
@@ -12,15 +13,19 @@ const generateAccessToken = (payload: object) => {
   return jwt.sign(payload, env.jwtSecret, { expiresIn: env.accessTokenExpiresIn });
 };
 
-const generateRefreshToken = (payload: object) => {
-  const withJti = Object.assign({}, payload, { jti: crypto.randomUUID() });
-  return jwt.sign(withJti, env.refreshTokenSecret, { expiresIn: env.refreshTokenExpiresIn });
-};
+const DAY_MS = 24 * 60 * 60 * 1000;
 
-const getExpiryDateFromToken = (token: string) => {
-  const decoded: any = jwt.decode(token);
-  if (!decoded || !decoded.exp) return new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-  return new Date(decoded.exp * 1000);
+/**
+ * Sliding refresh token: valid for refreshTokenExpiresInDays from now, but never beyond the absolute
+ * session cap (sessionMaxAgeDays after the original OTP login at [sessionStartedAt]).
+ */
+const issueRefreshToken = (payload: object, sessionStartedAt: Date) => {
+  const sessionEndsAt = sessionStartedAt.getTime() + env.sessionMaxAgeDays * DAY_MS;
+  const expiresAtMs = Math.min(Date.now() + env.refreshTokenExpiresInDays * DAY_MS, sessionEndsAt);
+  const expiresInSeconds = Math.max(1, Math.floor((expiresAtMs - Date.now()) / 1000));
+  const withJti = Object.assign({}, payload, { jti: crypto.randomUUID() });
+  const token = jwt.sign(withJti, env.refreshTokenSecret, { expiresIn: expiresInSeconds });
+  return { token, expiresAt: new Date(Date.now() + expiresInSeconds * 1000) };
 };
 
 // Fixed hardcoded OTP for development mode testing
@@ -94,10 +99,12 @@ export const verifyOtp = async (mobileNumber: string, otp: string) => {
     firstName: user.firstName,
     lastName: user.lastName,
   });
-  const refreshToken = generateRefreshToken({ id: user.id, mobileNumber: user.mobileNumber });
-  const tokenHash = hashToken(refreshToken);
-  const expiresAt = getExpiryDateFromToken(refreshToken);
-  await RefreshToken.create({ tokenHash, userId: user.id, expiresAt });
+  const sessionStartedAt = new Date();
+  const { token: refreshToken, expiresAt } = issueRefreshToken(
+    { id: user.id, mobileNumber: user.mobileNumber },
+    sessionStartedAt,
+  );
+  await RefreshToken.create({ tokenHash: hashToken(refreshToken), userId: user.id, expiresAt, sessionStartedAt });
 
   return {
     user: {
@@ -174,17 +181,8 @@ export const updateProfile = async (data: UpdateProfileData) => {
   user.isFirstLogin = false;
   await user.save();
 
-  const accessToken = generateAccessToken({
-    id: user.id,
-    mobileNumber: user.mobileNumber,
-    firstName: user.firstName,
-    lastName: user.lastName,
-  });
-  const refreshToken = generateRefreshToken({ id: user.id, mobileNumber: user.mobileNumber });
-  const tokenHash = hashToken(refreshToken);
-  const expiresAt = getExpiryDateFromToken(refreshToken);
-  await RefreshToken.create({ tokenHash, userId: user.id, expiresAt });
-
+  // NOTE: no tokens are issued here. They used to be generated and stored but never returned to the
+  // client (the response fields are commented out), leaving an orphan refresh_tokens row per profile save.
   return {
     user: {
       id: user.id,
@@ -196,34 +194,73 @@ export const updateProfile = async (data: UpdateProfileData) => {
       professionalDetails: user.professionalDetails || '',
       isFirstLogin: user.isFirstLogin,
     },
-    // accessToken,
-    // refreshToken,
   };
 };
 
 export const registerUser = updateProfile;
 
+/**
+ * Thrown for genuine authentication failures (bad/expired/revoked refresh token).
+ * Controllers map ONLY this to HTTP 401. Anything else (DB down, cold start, etc.)
+ * must be a 5xx so clients retry instead of logging the user out.
+ */
+export class AuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuthError';
+  }
+}
+
 export const rotateRefreshToken = async (oldToken: string) => {
   let payload: any;
   try {
     payload = jwt.verify(oldToken, env.refreshTokenSecret) as any;
-  } catch (err) {
-    throw new Error('Invalid refresh token');
+  } catch (err: any) {
+    throw new AuthError(err?.name === 'TokenExpiredError' ? 'Refresh token expired' : 'Invalid refresh token');
   }
 
   const tokenHash = hashToken(oldToken);
   const tokenRecord = await RefreshToken.findOne({ where: { tokenHash } });
-  if (!tokenRecord || tokenRecord.revoked) throw new Error('Invalid refresh token');
-  if (new Date() > tokenRecord.expiresAt) throw new Error('Refresh token expired');
+  if (!tokenRecord) throw new AuthError('Invalid refresh token');
+  if (new Date() > tokenRecord.expiresAt) throw new AuthError('Refresh token expired');
 
-  tokenRecord.revoked = true;
-  await tokenRecord.save();
+  // Rows created before sliding sessions have no sessionStartedAt; fall back to when they were issued.
+  const sessionStartedAt = tokenRecord.sessionStartedAt ?? tokenRecord.createdAt ?? new Date();
+  if (Date.now() > sessionStartedAt.getTime() + env.sessionMaxAgeDays * DAY_MS) {
+    throw new AuthError('Session expired. Please sign in again.');
+  }
+
+  if (tokenRecord.revoked) {
+    // Grace window: the token was rotated moments ago but the client is presenting it
+    // again — almost always because the previous /refresh response never reached the
+    // device (network drop, Render cold start, app killed, request cancelled).
+    // Without this, the client is stuck with a revoked token and gets logged out.
+    const rotatedAt = tokenRecord.rotatedAt ? new Date(tokenRecord.rotatedAt).getTime() : 0;
+    const withinGrace = rotatedAt > 0 && Date.now() - rotatedAt <= env.refreshReuseGraceMs;
+    if (!withinGrace) {
+      // Revoked by logout, or rotated long ago (possible token theft/replay).
+      throw new AuthError('Refresh token revoked');
+    }
+    console.warn(
+      `[Auth] Refresh token for user ${tokenRecord.userId} replayed ${Date.now() - rotatedAt}ms after rotation; issuing new pair (grace window).`,
+    );
+  } else {
+    tokenRecord.revoked = true;
+    tokenRecord.rotatedAt = new Date();
+    await tokenRecord.save();
+  }
 
   const accessToken = generateAccessToken({ id: payload.id, mobileNumber: payload.mobileNumber });
-  const refreshToken = generateRefreshToken({ id: payload.id, mobileNumber: payload.mobileNumber });
-  const newHash = hashToken(refreshToken);
-  const expiresAt = getExpiryDateFromToken(refreshToken);
-  await RefreshToken.create({ tokenHash: newHash, userId: tokenRecord.userId, expiresAt });
+  const { token: refreshToken, expiresAt } = issueRefreshToken(
+    { id: payload.id, mobileNumber: payload.mobileNumber },
+    new Date(sessionStartedAt),
+  );
+  await RefreshToken.create({
+    tokenHash: hashToken(refreshToken),
+    userId: tokenRecord.userId,
+    expiresAt,
+    sessionStartedAt: new Date(sessionStartedAt),
+  });
 
   return { accessToken, refreshToken };
 };
@@ -237,12 +274,39 @@ export const revokeRefreshToken = async (token: string) => {
   return true;
 };
 
+/**
+ * Deletes refresh-token rows that can never be used again: expired ones, and revoked ones that are
+ * past the replay grace window (kept briefly for audit). Rotation creates a row per refresh, so
+ * without this the table grows forever.
+ */
+export const purgeDeadRefreshTokens = async () => {
+  const now = new Date();
+  const revokedCutoff = new Date(now.getTime() - 7 * DAY_MS);
+  const deleted = await RefreshToken.destroy({
+    where: {
+      [Op.or]: [{ expiresAt: { [Op.lt]: now } }, { revoked: true, updatedAt: { [Op.lt]: revokedCutoff } }],
+    },
+  });
+  return deleted;
+};
+
 export const revokeUserTokens = async (userId: number) => {
-  await RefreshToken.update({ revoked: true }, { where: { userId, revoked: false } });
+  // Also clear rotatedAt so recently-rotated tokens can't use the reuse grace window.
+  await RefreshToken.update({ revoked: true, rotatedAt: null }, { where: { userId } });
   return true;
 };
 
-export const logoutUser = async (refreshToken?: string, userId?: number) => {
+/**
+ * Logs out.
+ *  - Default (a refresh token is supplied): revokes ONLY that device's refresh token.
+ *    Other devices stay signed in.
+ *  - allDevices=true, or no refresh token supplied: revokes every refresh token for the
+ *    user and sets lastLogoutAt, which also invalidates all outstanding access tokens.
+ *
+ * Previously every logout did the "all devices" path, so signing out (or reinstalling
+ * and signing out) on one phone silently logged out every other phone.
+ */
+export const logoutUser = async (refreshToken?: string, userId?: number, allDevices = false) => {
   let targetUserId = userId;
 
   if (refreshToken) {
@@ -251,8 +315,10 @@ export const logoutUser = async (refreshToken?: string, userId?: number) => {
     if (tokenRecord) {
       targetUserId = targetUserId || tokenRecord.userId;
       tokenRecord.revoked = true;
+      tokenRecord.rotatedAt = null; // logout revocation is never eligible for the reuse grace window
       await tokenRecord.save();
     }
+    if (!allDevices) return true;
   }
 
   if (targetUserId) {
@@ -284,6 +350,7 @@ export default {
   rotateRefreshToken,
   revokeRefreshToken,
   revokeUserTokens,
+  purgeDeadRefreshTokens,
   logoutUser,
   verifyAccessToken,
 };

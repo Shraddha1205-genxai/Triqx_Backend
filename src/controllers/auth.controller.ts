@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import authService from '../services/auth.service';
+import authService, { AuthError } from '../services/auth.service';
 
 export const sendOtp = async (req: Request, res: Response) => {
   try {
@@ -106,13 +106,20 @@ export const refresh = async (req: Request, res: Response) => {
     const tokens = await authService.rotateRefreshToken(refreshToken);
     return res.status(200).json({ success: true, data: tokens });
   } catch (error: any) {
-    return res.status(401).json({ success: false, message: error.message || 'Invalid refresh token' });
+    // Only a genuine auth failure is a 401 (client should log out).
+    // Infrastructure errors (DB unreachable, cold start, etc.) are 503 so the client
+    // keeps its session and retries later. Previously ALL errors were 401.
+    if (error instanceof AuthError) {
+      return res.status(401).json({ success: false, message: error.message });
+    }
+    console.error('[Auth] refresh failed with non-auth error:', error?.message || error);
+    return res.status(503).json({ success: false, message: 'Token service temporarily unavailable. Please retry.' });
   }
 };
 
 export const logout = async (req: Request, res: Response) => {
   try {
-    const { refreshToken } = req.body;
+    const { refreshToken, allDevices } = req.body;
     const userId = (req as any).user?.id;
 
     if (!refreshToken && !userId) {
@@ -122,7 +129,7 @@ export const logout = async (req: Request, res: Response) => {
       });
     }
 
-    await authService.logoutUser(refreshToken, userId);
+    await authService.logoutUser(refreshToken, userId, allDevices === true);
 
     return res.status(200).json({
       success: true,
